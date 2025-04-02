@@ -1,5 +1,5 @@
 My capstone project for the Rust Bootcamp — Winter 2025.
-The idea was chosen from a [list](capstone_doc/ideas.md).
+The idea was chosen from a [list](ideas.md).
 
 The following prerequisites would be helpful to understand this document:
 
@@ -55,9 +55,9 @@ If there are no HTTP requests, the client downloads torrents as usual.
 The UI was not extended to control the plugin.
 A user communicates with the plugin through command-line options and the log.
 
-# [Usage](capstone_doc/usage.md)
+# [Usage](usage.md)
 
-# [Architecture](capstone_doc/arch.md)
+# [Architecture](arch.md)
 
 # To reviewers
 
