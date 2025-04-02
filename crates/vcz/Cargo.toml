@@ -35,3 +35,4 @@ vincenzo = { path = "../vincenzo" }
 vcz_ui = { path = "../vcz_ui" }
 tracing-appender = "0.2.2"
 time = "0.3.30"
+vcz_http_server = { path = "../vcz_http_server" }

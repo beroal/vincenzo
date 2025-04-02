@@ -42,6 +42,14 @@ pub struct Args {
     /// Print all torrent status on stdout
     #[clap(short, long)]
     pub stats: bool,
+
+    /// HTTP server address
+    #[clap(long)]
+    pub http_server_addr: Option<SocketAddr>,
+
+    /// Do not use trackers
+    #[clap(long)]
+    pub no_tracker: bool,
 }
 
 /// The daemon is the highest-level entity in the library.
@@ -58,7 +66,8 @@ pub struct Args {
 /// uses HTTP.
 pub struct Daemon {
     pub config: DaemonConfig,
-    pub disk_tx: Option<mpsc::Sender<DiskMsg>>,
+    pub disk_tx: mpsc::Sender<DiskMsg>,
+    disk_rx: Option<mpsc::Receiver<DiskMsg>>,
     pub ctx: Arc<DaemonCtx>,
     /// key: info_hash
     pub torrent_txs: HashMap<[u8; 20], mpsc::Sender<TorrentMsg>>,
@@ -83,6 +92,7 @@ pub struct DaemonConfig {
     pub download_dir: String,
     /// If the program should quit after all torrents are fully downloaded
     pub quit_after_complete: bool,
+    pub no_tracker: bool,
 }
 
 /// Messages used by the [`Daemon`] for internal communication.
@@ -119,11 +129,15 @@ impl Daemon {
             download_dir,
             listen: Self::DEFAULT_LISTENER,
             quit_after_complete: false,
+            no_tracker: true,
         };
+
+        let (disk_tx, disk_rx) = mpsc::channel::<DiskMsg>(300);
 
         Self {
             rx,
-            disk_tx: None,
+            disk_tx,
+            disk_rx: Some(disk_rx),
             config: daemon_config,
             torrent_txs: HashMap::new(),
             ctx: Arc::new(DaemonCtx {
@@ -131,6 +145,10 @@ impl Daemon {
                 torrent_states: RwLock::new(HashMap::new()),
             }),
         }
+    }
+
+    pub fn get_disk_tx(&self) -> mpsc::Sender<DiskMsg> {
+        self.disk_tx.clone()
     }
 
     /// This function will listen to 3 different event loops:
@@ -150,10 +168,10 @@ impl Daemon {
     pub async fn run(&mut self) -> Result<(), Error> {
         let socket = TcpListener::bind(self.config.listen).await.unwrap();
 
-        let (disk_tx, disk_rx) = mpsc::channel::<DiskMsg>(300);
-        self.disk_tx = Some(disk_tx);
-
-        let mut disk = Disk::new(disk_rx, self.config.download_dir.to_string());
+        let mut disk = Disk::new(
+            std::mem::take(&mut self.disk_rx).unwrap(),
+            self.config.download_dir.to_string(),
+        );
 
         spawn(async move {
             disk.run().await.unwrap();
@@ -325,7 +343,7 @@ impl Daemon {
         Ok(())
     }
 
-    /// Sends a Draw message to the [`UI`] with the updated state of a torrent.
+    /// Sends a Draw message to the `UI` with the updated state of a torrent.
     async fn draw<T>(sink: &mut T, ctx: Arc<DaemonCtx>) -> Result<(), Error>
     where
         T: SinkExt<Message> + Sized + std::marker::Unpin + Send,
@@ -375,14 +393,15 @@ impl Daemon {
 
         // disk_tx is not None at this point, this is safe
         // (if calling after run)
-        let disk_tx = self.disk_tx.clone().unwrap();
+        let disk_tx = self.disk_tx.clone();
         let mut torrent = Torrent::new(disk_tx, self.ctx.tx.clone(), magnet);
 
         self.torrent_txs.insert(info_hash, torrent.ctx.tx.clone());
         info!("Downloading torrent: {}", torrent.name);
 
+        let no_tracker = self.config.no_tracker;
         spawn(async move {
-            torrent.start_and_run(None).await?;
+            torrent.start_and_run(None, no_tracker).await?;
             Ok::<(), Error>(())
         });
 
@@ -397,7 +416,7 @@ impl Daemon {
                 let _ = tx.send(TorrentMsg::Quit).await;
             });
         }
-        let _ = self.disk_tx.as_ref().unwrap().send(DiskMsg::Quit).await;
+        let _ = self.disk_tx.send(DiskMsg::Quit).await;
         Ok(())
     }
 }

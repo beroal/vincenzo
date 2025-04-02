@@ -1,6 +1,6 @@
 use clap::Parser;
 use tokio::{runtime::Runtime, spawn, sync::mpsc};
-use tracing::{debug, Level};
+use tracing::{warn, debug, Level};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt::time::OffsetTime, FmtSubscriber};
 use vincenzo::{
@@ -30,7 +30,7 @@ async fn main() -> Result<(), Error> {
             time::UtcOffset::current_local_offset()
                 .unwrap_or(time::UtcOffset::UTC),
             time::format_description::parse(
-                "[year]-[month]-[day] [hour]:[minute]:[second]",
+                "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:6]",
             )
             .unwrap(),
         ))
@@ -42,6 +42,7 @@ async fn main() -> Result<(), Error> {
 
     let args = Args::parse();
     let config = Config::load().await.unwrap();
+    debug!(?config, "configuration");
 
     let download_dir = args.download_dir.unwrap_or(config.download_dir.clone());
     let daemon_addr = args.daemon_addr.unwrap_or(
@@ -50,6 +51,9 @@ async fn main() -> Result<(), Error> {
 
     let mut daemon = Daemon::new(download_dir);
     daemon.config.listen = daemon_addr;
+    daemon.config.no_tracker = args.no_tracker;
+
+    let disk_tx = daemon.get_disk_tx();
 
     let rt = Runtime::new().unwrap();
     let handle = std::thread::spawn(move || {
@@ -58,6 +62,23 @@ async fn main() -> Result<(), Error> {
             debug!("daemon exited run");
         });
     });
+
+    let http_server_addr = args.http_server_addr.or(
+        config.http_server_addr
+    );
+    if let Some(http_server_addr) = http_server_addr {
+        spawn(async move {
+            match tokio::net::TcpListener::bind(http_server_addr).await {
+                Err(error) => warn!(?error, "when binding an HTTP socket"),
+                Ok(tcp_listener) => vcz_http_server::main(
+                    tcp_listener,
+                    disk_tx,
+                    std::future::pending::<()>(),
+                    std::time::Duration::from_secs(2),
+                ).await,
+            }
+        });
+    }
 
     // Start and run the terminal UI
     let (fr_tx, fr_rx) = mpsc::channel::<UIMsg>(300);

@@ -97,4 +97,10 @@ pub enum Error {
     NoDuplicateTorrent,
     #[error("No peers in the torrent")]
     NoPeers,
+    #[error("Piece is already downloaded")]
+    PieceDownloaded,
+    #[error("Piece index is invalid")]
+    PieceIndexInvalid,
+    #[error("Received metainfo is invalid: {0}")]
+    MetainfoInvalid(std::num::TryFromIntError),
 }

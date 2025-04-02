@@ -12,6 +12,7 @@ use crate::{daemon::Daemon, error::Error};
 pub struct Config {
     pub download_dir: String,
     pub daemon_addr: Option<SocketAddr>,
+    pub http_server_addr: Option<SocketAddr>,
 }
 
 impl Config {
@@ -40,22 +41,6 @@ impl Config {
             })?
         }
 
-        // check that the user's download dir is valid
-        let download_dir = UserDirs::new()
-            .ok_or(Error::FolderNotFound(
-                "home".into(),
-                config_path.to_str().unwrap().to_owned(),
-            ))
-            .unwrap()
-            .download_dir()
-            .ok_or(Error::FolderNotFound(
-                "download".into(),
-                config_path.to_str().unwrap().to_owned(),
-            ))?
-            .to_str()
-            .unwrap()
-            .into();
-
         config_path.push("config.toml");
 
         // try to open the config file, and create one
@@ -77,9 +62,26 @@ impl Config {
         let c = toml::from_str::<Config>(&dst);
 
         if c.is_err() {
+            // check that the user's download dir is valid
+            let download_dir = UserDirs::new()
+                .ok_or(Error::FolderNotFound(
+                    "home".into(),
+                    config_path.to_str().unwrap().to_owned(),
+                ))
+                .unwrap()
+                .download_dir()
+                .ok_or(Error::FolderNotFound(
+                    "download".into(),
+                    config_path.to_str().unwrap().to_owned(),
+                ))?
+                .to_str()
+                .unwrap()
+                .into();
+
             let default_config = Config {
                 download_dir,
                 daemon_addr: Some(Daemon::DEFAULT_LISTENER),
+                http_server_addr: None,
             };
 
             let config_str = toml::to_string(&default_config).unwrap();

@@ -23,11 +23,8 @@ pub struct MetaInfo {
     pub http_seeds: Option<Vec<String>>,
 }
 
-/// File related information (Single-file format)
-/// <https://fileformats.fandom.com/wiki/Torrent_file>
-/// in a multi file format, `name` is name of the directory
-/// `file_length` is specific to Single File format
-/// in a multi file format, `file_length` is replaced to `files`
+/// The `info` part of a torrent file.
+/// See <https://fileformats.fandom.com/wiki/Torrent_file>.
 #[derive(Debug, PartialEq, Clone, Default)]
 pub struct Info {
     /// piece length - number of bytes in a piece
@@ -35,10 +32,15 @@ pub struct Info {
     /// A (byte) string consisting of the concatenation of all 20-byte SHA1
     /// hash values, one per piece.
     pub pieces: Vec<u8>,
-    /// name of the file
+    /// In the single-file format, the suggested name of the file.
+    /// In the multi-file format, the suggested name of the directory
+    /// containing torrent files.
     pub name: String,
-    /// length - bytes of the entire file
-    pub file_length: Option<u32>,
+    /// In the single-file format, the length of the file in bytes.
+    /// In the multi-file format, `None`.
+    pub file_length: Option<u64>,
+    /// In the single-file format, `None`.
+    /// In the multi-file format, the list of the file paths.
     pub files: Option<Vec<File>>,
 }
 
@@ -63,11 +65,12 @@ impl Info {
     /// Returns an Err if the Info is malformed, if it does not have `files` or
     /// `file_length`.
     pub fn get_block_infos(&self) -> Result<VecDeque<BlockInfo>, error::Error> {
-        let total_size = self.get_size() as u32;
+        let total_size = self.get_size();
         let mut block_infos = Vec::new();
         let mut processed_bytes = 0;
         let mut offset_within_file = 0;
         let mut file_index = 0;
+        let piece_length: u64 = self.piece_length.into();
 
         while processed_bytes < total_size {
             let remaining_in_file =
@@ -76,8 +79,8 @@ impl Info {
                 });
             let len = [
                 remaining_in_file,
-                self.piece_length - processed_bytes % self.piece_length,
-                BLOCK_LEN,
+                piece_length - processed_bytes % piece_length,
+                BLOCK_LEN.into(),
             ]
             .iter()
             .cloned()
@@ -85,9 +88,15 @@ impl Info {
             .unwrap();
 
             block_infos.push(BlockInfo {
-                index: (processed_bytes / self.piece_length),
-                begin: processed_bytes % self.piece_length,
-                len,
+                index: (processed_bytes / piece_length)
+                    .try_into()
+                    .map_err(error::Error::MetainfoInvalid)?,
+                begin: (processed_bytes % piece_length)
+                    .try_into()
+                    .map_err(error::Error::MetainfoInvalid)?,
+                len: len
+                    .try_into()
+                    .map_err(error::Error::MetainfoInvalid)?,
             });
 
             processed_bytes += len;
@@ -142,7 +151,7 @@ impl Info {
 #[derive(Debug, PartialEq, Clone, Default, Hash, Eq)]
 pub struct File {
     /// Length of the file in bytes.
-    pub length: u32,
+    pub length: u64,
     /// Path of the file, excluding the parent name.
     pub path: Vec<String>,
 }
@@ -150,11 +159,11 @@ pub struct File {
 impl File {
     /// Get the len of the given piece in the file, in bytes..
     pub fn get_piece_len(&self, piece: u32, piece_length: u32) -> u32 {
-        let b = (piece * piece_length) + piece_length;
+        let b = u64::from(piece) * u64::from(piece_length) + u64::from(piece_length);
         if b <= self.length {
             piece_length
         } else {
-            self.length % piece_length
+            (self.length % u64::from(piece_length)).try_into().unwrap()
         }
     }
     /// Return the number of pieces in the file, rounded up.
@@ -189,7 +198,7 @@ impl FromBencode for File {
             match pair {
                 (b"length", value) => {
                     length =
-                        u32::decode_bencode_object(value).context("length")?;
+                        u64::decode_bencode_object(value).context("length")?;
                 }
                 (b"path", value) => {
                     path = Vec::<String>::decode_bencode_object(value)
@@ -340,7 +349,8 @@ impl FromBencode for Info {
                         .map(Some)?;
                 }
                 (b"length", value) => {
-                    file_length = u32::decode_bencode_object(value)
+                    /* Why do you think that a file can't be larger than `2**32` bytes? */
+                    file_length = u64::decode_bencode_object(value)
                         .context("file.length")
                         .map(Some)?;
                 }
