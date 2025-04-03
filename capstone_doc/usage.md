@@ -7,6 +7,7 @@ through command-line options and the log.
 ## Compilation
 
 Compile it with Cargo as usual for Rust programs.
+It requires the nightly compiler for the `impl_trait_in_assoc_type` feature.
 For a starter, it's enough to compile the `vcz` crate.
 
 ## Running
