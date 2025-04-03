@@ -1,4 +1,4 @@
-My capstone project for the Rust Bootcamp — Winter 2025.
+My capstone project “BitTorrent media streaming” for the Rust Bootcamp — Winter 2025.
 The idea was chosen from a [list](ideas.md).
 
 The following prerequisites would be helpful to understand this document:
