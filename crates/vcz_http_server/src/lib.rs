@@ -8,12 +8,12 @@
 //! - resp ~ response
 //! - rh ~ range header
 //!
-//! They are used in other crates too.
+//! I used them in my code inserted into other crates.
 
-pub mod range_from;
+pub mod range_conv;
 pub mod byte_content_range;
 
-use std::{future::Future, task::Poll, ops::{Range, RangeInclusive}};
+use std::{pin::Pin, future::Future, task::Poll, ops::{Range, RangeInclusive}};
 use pin_project::pin_project;
 use std::fmt::Debug;
 use std::collections::VecDeque;
@@ -34,7 +34,7 @@ use vincenzo::disk::{
     FileByPathR,
     DiskMsg,
 };
-use range_from::{TryFromRange as _, TryFromRangeError};
+use range_conv::{TryFromRange as _, TryFromRangeError};
 use byte_content_range::ContentRange;
 
 
@@ -97,21 +97,31 @@ fn rh_in_file(
 
 
 
-fn decode_info_hash(info_hash: &str) -> Result<InfoHash, ()> {
-    let info_hash = info_hash.as_bytes();
+#[derive(Debug, thiserror::Error)]
+enum DecodeInfoHashError {
+    #[error("textual info hash is of wrong length")]
+    WrongLen,
 
+    #[error("when decoding base64: {0}")]
+    Base64(base64::DecodeError),
+
+    #[error("binary info hash is of wrong length")]
+    VecToArray,
+}
+
+fn decode_info_hash(info_hash: &str) -> Result<InfoHash, DecodeInfoHashError> {
     /// The number of characters in a Base64 encoding of a SHA-1 hash.
     const INFO_HASH_BASE64_CHAR_N: u8 = INFO_HASH_BIT_N
         .div_ceil(6)
         .div_ceil(4)
         * 4;
 
-    if info_hash.len() != INFO_HASH_BASE64_CHAR_N.into() { Err(()) } else {
-        match URL_SAFE.decode(info_hash) {
-            Err(_) => Err(()),
-            Ok(info_hash) => info_hash.try_into().map_err(|_| ()),
-        }
+    let info_hash = info_hash.as_bytes();
+    if info_hash.len() != INFO_HASH_BASE64_CHAR_N.into() {
+        return Err(DecodeInfoHashError::WrongLen);
     }
+    let info_hash = URL_SAFE.decode(info_hash).map_err(DecodeInfoHashError::Base64)?;
+    info_hash.try_into().map_err(|_| DecodeInfoHashError::VecToArray)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -125,11 +135,11 @@ enum ParseUriPathError {
     #[error("the URI path should start with an info hash")]
     NoInfoHash,
 
-    #[error("invalid info hash in the URI path")]
-    InvalidInfoHash,
+    #[error("invalid info hash in the URI path: {0}")]
+    InvalidInfoHash(DecodeInfoHashError),
 
-    #[error("a URI path component is not encoded with UTF-8")]
-    FromUtf8,
+    #[error("a URI path component is not encoded with UTF-8: {0}")]
+    FromUtf8(std::string::FromUtf8Error),
 }
 
 /// Web routing.
@@ -143,28 +153,18 @@ fn parse_uri_path(
     let mut uri_path = uri_path.split('/').collect::<VecDeque<_>>();
     match uri_path.pop_front() {
         None => Err(ParseUriPathError::Split),
-        Some(first) => if !first.is_empty() {
-            Err(ParseUriPathError::StartSlash)
-        } else {
-            match uri_path.pop_front() {
-                None => Err(ParseUriPathError::NoInfoHash),
-                Some(info_hash) => match decode_info_hash(info_hash) {
-                    Err(_) => Err(ParseUriPathError::InvalidInfoHash),
-                    Ok(info_hash) => {
-                        let path: Result<Vec<_>, _> = Result::from_iter(
-                            uri_path
-                                .into_iter()
-                                .map(|s| urlencoding::decode(s)
-                                    .map(std::borrow::Cow::into_owned)
-                                )
-                        );
-                        match path {
-                            Err(_) => Err(ParseUriPathError::FromUtf8),
-                            Ok(path) => Ok((info_hash, path)),
-                        }
-                    },
-                },
-            }
+        Some(first) if !first.is_empty() => Err(ParseUriPathError::StartSlash),
+        Some(_) => {
+            let info_hash = uri_path.pop_front().ok_or(ParseUriPathError::NoInfoHash)?;
+            let info_hash = decode_info_hash(info_hash)
+                .map_err(ParseUriPathError::InvalidInfoHash)?;
+            let path: Vec<_> = Result::from_iter(
+                uri_path
+                    .into_iter()
+                    .map(|s| urlencoding::decode(s).map(std::borrow::Cow::into_owned))
+            )
+            .map_err(ParseUriPathError::FromUtf8)?;
+            Ok((info_hash, path))
         },
     }
 }
@@ -307,7 +307,7 @@ struct ContentBody {
     /// to understand how this is used.
     #[pin] read_future: Option<<SliceReader as SliceReaderI>::ReadFuture>,
 
-    /// The remaiining size of the slice.
+    /// The remaining size of the slice.
     rem_size: u64,
 }
 
@@ -317,45 +317,50 @@ impl ContentBody {
         file_id: FileId,
         range_in_file: Range<u64>,
     ) -> Result<Self, CallDiskError> {
-        let rem_size = range_from::range_len(range_in_file.clone());
+        let rem_size = range_conv::range_len(range_in_file.clone());
         cs.new_slice(file_id, range_in_file).await.map(|slice_reader| {
             Self { slice_reader, read_future: None, rem_size }
         })
     }
 
     fn handle_resp(
-        self: std::pin::Pin<&mut Self>,
-        resp: ReadOutput,
-    ) -> Option<
-        Result<
-            http_body::Frame<<ContentBody as http_body::Body>::Data>,
-            <ContentBody as http_body::Body>::Error,
+        self: Pin<&mut Self>,
+        resp: Poll<ReadOutput>,
+    ) ->
+    Poll<
+        Option<
+            Result<
+                http_body::Frame<<ContentBody as http_body::Body>::Data>,
+                <ContentBody as http_body::Body>::Error,
+            >
         >
     >
     {
-        let mut selfp = self.project();
-        selfp.read_future.set(None);
-        Some(resp.map(|mut a| {
-            let size = u64::try_from(a.len()).unwrap();
-            let rem_size = selfp.rem_size;
-            match rem_size.checked_sub(size) {
-                None => {
-                    warn!(
-                        size,
-                        rem_size,
-                        "the HTTP server received a block of content \
-                            larger than the remaining amount of content",
-                    );
-                    a.truncate((*rem_size).try_into().unwrap());
-                    *rem_size = 0;
-                },
-                Some(new_rem_size) => {
-                    debug!(size, new_rem_size, "ContentBody received content");
-                    *rem_size = new_rem_size;
-                },
-            }
-            http_body::Frame::data(a)
-        }))
+        resp.map(|resp| {
+            let mut selfp = self.project();
+            selfp.read_future.set(None);
+            Some(resp.map(|mut chunk| {
+                let size = u64::try_from(chunk.len()).unwrap();
+                let rem_size = selfp.rem_size;
+                match rem_size.checked_sub(size) {
+                    None => {
+                        warn!(
+                            size,
+                            rem_size,
+                            "the HTTP server received a chunk of content \
+                                larger than the remaining amount of content",
+                        );
+                        chunk.truncate((*rem_size).try_into().unwrap());
+                        *rem_size = 0;
+                    },
+                    Some(new_rem_size) => {
+                        debug!(size, new_rem_size, "ContentBody received content");
+                        *rem_size = new_rem_size;
+                    },
+                }
+                http_body::Frame::data(chunk)
+            }))
+        })
     }
 }
 
@@ -367,23 +372,23 @@ impl http_body::Body for ContentBody {
     /// by calling the [`SliceReaderI::read`] method
     /// of the [`ContentBody::slice_reader`] field.
     fn poll_frame(
-        mut self: std::pin::Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         let selfp = self.as_mut().project();
         let mut read_future = selfp.read_future;
         match read_future.as_mut().as_pin_mut() {
-            None => if *selfp.rem_size == 0 { Poll::Ready(None) } else {
+            None => if *selfp.rem_size == 0 {
+                Poll::Ready(None)
+            } else {
                 read_future.as_mut().set(Some(selfp.slice_reader.read()));
-                read_future
-                    .as_pin_mut()
-                    .unwrap()
-                    .poll(cx)
-                    .map(|resp| self.handle_resp(resp))
+                let resp = read_future.as_pin_mut().unwrap().poll(cx);
+                self.handle_resp(resp)
             },
-            Some(read_future) => read_future
-                .poll(cx)
-                .map(|resp| self.handle_resp(resp)),
+            Some(read_future) => {
+                let resp = read_future.poll(cx);
+                self.handle_resp(resp)
+            },
         }
     }
 
@@ -397,7 +402,13 @@ impl http_body::Body for ContentBody {
 
 type EmptyBody<D> = http_body_util::Empty<D>;
 
-fn empty_resp<S: TryInto<StatusCode>, D: bytes::Buf>(
+fn my_resp_builder() -> response::Builder {
+    Response::builder()
+        .version(http::Version::HTTP_11)
+        .header(http::header::ACCEPT_RANGES, "bytes")
+}
+
+fn my_empty_resp<S: TryInto<StatusCode>, D: bytes::Buf>(
     status_code: S,
 ) -> Result<Response<EmptyBody<D>>, http::Error>
 where <S as TryInto<StatusCode>>::Error: Into<http::Error>
@@ -411,55 +422,49 @@ fn binary_content_type(a: response::Builder) -> response::Builder {
     a.header(http::header::CONTENT_TYPE, "application/octet-stream")
 }
 
-type MyResp = Response<MyBody>;
-
-fn my_resp_builder() -> response::Builder {
-    Response::builder()
-        .version(http::Version::HTTP_11)
-        .header(http::header::ACCEPT_RANGES, "bytes")
-}
-
 /// HTTP response body.
 /// It may be empty (for errors) or contain torrent content.
 type MyBody = http_body_util::Either<EmptyBody<Bytes>, ContentBody>;
 
-fn from_empty_body<E>(
+type MyResp = Response<MyBody>;
+
+fn my_resp_from_empty<E>(
     a: Result<Response<EmptyBody<Bytes>>, E>,
 ) -> Result<MyResp, E> {
     a.map(|resp| resp.map(http_body_util::Either::Left))
 }
 
-fn from_content_body<E>(
+fn my_resp_from_content<E>(
     a: Result<Response<ContentBody>, E>,
 ) -> Result<MyResp, E> {
     a.map(|resp| resp.map(http_body_util::Either::Right))
 }
 
-fn my_empty_resp<S: TryInto<StatusCode>>(
+fn my_resp_from_status<S: TryInto<StatusCode>>(
     status_code: S,
 ) -> Result<MyResp, http::Error>
 where <S as TryInto<StatusCode>>::Error: Into<http::Error>
 {
-    from_empty_body(empty_resp(status_code))
+    my_resp_from_empty(my_empty_resp(status_code))
 }
 
 fn resp_500(error: impl Debug) -> Result<MyResp, http::Error> {
     error!(?error, "StatusCode::INTERNAL_SERVER_ERROR");
-    my_empty_resp(StatusCode::INTERNAL_SERVER_ERROR)
+    my_resp_from_status(StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 fn bad_request(error: impl Debug) -> Result<MyResp, http::Error> {
     info!(?error, "StatusCode::BAD_REQUEST");
-    my_empty_resp(StatusCode::BAD_REQUEST)
+    my_resp_from_status(StatusCode::BAD_REQUEST)
 }
 
 /// If `a` is `Err(e)`, sends a 500 (Internal Server Error) response.
 /// If `a` is `Ok(b)`, sends `f(b)`.
-async fn map_err_to_500<T, RFuture>(
+async fn map_err_to_500<T, ResultFuture>(
     a: Result<T, impl Debug>,
-    f: impl FnOnce(T) -> RFuture,
+    f: impl FnOnce(T) -> ResultFuture,
 ) -> Result<MyResp, http::Error>
-where RFuture: Future<Output = Result<MyResp, http::Error>>
+where ResultFuture: Future<Output = Result<MyResp, http::Error>>
 {
     match a {
         Err(e) => resp_500(e),
@@ -477,13 +482,13 @@ async fn service_path_range(
             ParseUriPathError::Split => resp_500(e),
             ParseUriPathError::StartSlash => resp_500(e),
             ParseUriPathError::NoInfoHash => bad_request(e),
-            ParseUriPathError::InvalidInfoHash => bad_request(e),
-            ParseUriPathError::FromUtf8 => bad_request(e),
+            ParseUriPathError::InvalidInfoHash(_) => bad_request(e),
+            ParseUriPathError::FromUtf8(_) => bad_request(e),
         },
         Ok((info_hash, path)) => match cs.file_by_path(info_hash, path).await {
             Err(error) => {
                 info!(?error, "StatusCode::NOT_FOUND");
-                my_empty_resp(StatusCode::NOT_FOUND)
+                my_resp_from_status(StatusCode::NOT_FOUND)
             },
             Ok(FileByPathR { i: file_i, len: file_length }) => {
                 let file_id = FileId { info_hash, i: file_i };
@@ -493,7 +498,7 @@ async fn service_path_range(
                             map_err_to_500(ContentBody::new(cs, file_id, range).await,
                                 |content_body| async move {
                                     debug!("serving content with StatusCode::OK");
-                                    from_content_body(
+                                    my_resp_from_content(
                                         binary_content_type(
                                             my_resp_builder().status(StatusCode::OK)
                                         )
@@ -509,7 +514,7 @@ async fn service_path_range(
                             RhInFileError::RangeUnsatisfiable(error) => {
                                 info!(?error, "StatusCode::RANGE_NOT_SATISFIABLE");
                                 /* See https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status/416 . */
-                                from_empty_body(
+                                my_resp_from_empty(
                                     my_resp_builder()
                                         .status(StatusCode::RANGE_NOT_SATISFIABLE)
                                         .header(
@@ -529,7 +534,7 @@ async fn service_path_range(
                                 map_err_to_500(ContentBody::new(cs, file_id, range).await,
                                     |content_body| async move {
                                         debug!("serving content with StatusCode::PARTIAL_CONTENT");
-                                        from_content_body(
+                                        my_resp_from_content(
                                             binary_content_type(
                                                 my_resp_builder()
                                                     .status(StatusCode::PARTIAL_CONTENT)
@@ -570,10 +575,10 @@ async fn service<B>(
             };
             if !is_scheme_valid {
                 info!("invalid URI scheme");
-                my_empty_resp(StatusCode::NOT_FOUND)
+                my_resp_from_status(StatusCode::NOT_FOUND)
             } else if uri.query().is_some() {
                 info!("the URI query must be empty");
-                my_empty_resp(StatusCode::NOT_FOUND)
+                my_resp_from_status(StatusCode::NOT_FOUND)
             } else {
                 match parse_rh(&headers) {
                     None => service_path_range(cs, uri.path(), None).await,
@@ -585,7 +590,7 @@ async fn service<B>(
             }
         },
         http::Method::HEAD => resp_500("the HEAD HTTP method is not implemented") /* TODO */,
-        _ => my_empty_resp(StatusCode::NOT_IMPLEMENTED),
+        _ => my_resp_from_status(StatusCode::NOT_IMPLEMENTED),
     }
 }
 
