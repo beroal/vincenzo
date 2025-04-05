@@ -89,7 +89,7 @@ pub enum SliceError {
     Db(#[from] SliceDbError),
 
     #[error("reading of a slice block failed (internal): {0}")]
-    ReadBlock(crate::error::Error),
+    ReadBlock(Error),
 
     #[error("removing a prefix of the slice failed (internal)")]
     RemovePrefix,
@@ -97,6 +97,7 @@ pub enum SliceError {
 
 /// Calculates a prefix of `range` in a torrent suitable for sending it
 /// to a slice reader.
+/// `range.start <= range.end && range.start < piece_len * (u32::MAX + 1)` must hold.
 /// The length of the result will be at most [`SLICE_PREFIX_SIZE_LIMIT`].
 /// The result will be inside a piece.
 /// If `range` is not empty, the result will be not empty.
@@ -135,6 +136,8 @@ fn calc_slice_prefix(
 /// For example, if the first piece range is `[10, 11, 12, 13, 14]`
 /// and the second piece range is `[8, 9, 10]`,
 /// then the result will be `[10, 8, 11, 9, 12, 10, 13, 14]`.
+/// `range.start <= range.end && range.end < piece_len * u32::MAX` must hold
+/// for every `range` in `ranges`.
 /// The result may contain duplicates.
 fn slices_to_pieces(mut ranges: Vec<&Range<u64>>, piece_len: u32) -> impl Iterator<Item = u32> {
     let piece_len: u64 = piece_len.into();

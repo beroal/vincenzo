@@ -8,3 +8,8 @@ members = [
 ]
 
 resolver = "2"
+
+[workspace.dependencies]
+vincenzo = { path = "crates/vincenzo" }
+vcz_http_server = { path = "crates/vcz_http_server" }
+vcz_ui = { path = "crates/vcz_ui" }
