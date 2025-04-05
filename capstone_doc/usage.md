@@ -32,6 +32,9 @@ where the client saves torrents it downloads.
 
 Use the command-line option `-m $X`
 where `$X` is the magnet URI of the desired torrent.
+An example magnet URI
+of a [short movie “Tears of Steel” (2012)](magnet:?xt=urn:btih:1EF2640A24086AE02E3F5BAB423580E4C1C27DE6&dn=Tears+of+Steel+%282012%29+Sci-Fi+BR2DVD+DD2.0+NL+Subs&tr=http%3A%2F%2Ffr33dom.h33t.com%3A3310%2Fannounce&tr=udp%3A%2F%2Ffr33domtracker.h33t.com%3A3310%2Fannounce&tr=udp%3A%2F%2Ftracker.openbittorrent.com%3A80&tr=udp%3A%2F%2Ftracker.1337x.org%3A80%2Fannounce&tr=udp%3A%2F%2Ftracker.istole.it%3A80&tr=udp%3A%2F%2Ftracker.ccc.de%3A80&tr=udp%3A%2F%2F9.rarbg.com%3A2710%2Fannounce&tr=udp%3A%2F%2F11.rarbg.com%3A80%2Fannounce&tr=udp%3A%2F%2F10.rarbg.com%2Fannounce&tr=udp%3A%2F%2Ftracker.publicbt.com%3A80%2Fannounce&tr=http%3A%2F%2Fcpleft.com%3A2710%2Fannounce&tr=http%3A%2F%2Ftracker.torrentbay.to%3A6969%2Fannounce&tr=http%3A%2F%2Fipv4.tracker.harry.lu%2Fannounce&tr=http%3A%2F%2Fretracker.kld.ru%2Fannounce&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce&tr=http%3A%2F%2Ftracker.openbittorrent.com%3A80%2Fannounce&tr=udp%3A%2F%2Fopentracker.i2p.rocks%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.internetwarriors.net%3A1337%2Fannounce&tr=udp%3A%2F%2Ftracker.leechers-paradise.org%3A6969%2Fannounce&tr=udp%3A%2F%2Fcoppersurfer.tk%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.zer0day.to%3A1337%2Fannounce)
+(571 MB, 15 peers) published under a Creative Commons licence.
 
 It's okay if the client fully loads the CPU. The client is inefficient.
 Switching off logging increases its speed significantly.
