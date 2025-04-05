@@ -42,7 +42,6 @@ async fn main() -> Result<(), Error> {
 
     let args = Args::parse();
     let config = Config::load().await.unwrap();
-    debug!(?config, "configuration");
 
     let download_dir = args.download_dir.unwrap_or(config.download_dir.clone());
     let daemon_addr = args.daemon_addr.unwrap_or(

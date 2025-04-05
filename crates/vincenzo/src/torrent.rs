@@ -452,7 +452,6 @@ impl Torrent {
                                 });
 
                                 let have_all_pieces = info_len as u32 >= total;
-                                debug!(have_all_pieces, "");
 
                                 if have_all_pieces {
                                     // info has a valid bencode format

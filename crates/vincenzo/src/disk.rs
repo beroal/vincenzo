@@ -6,6 +6,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use base64::engine::{Engine as _, general_purpose::URL_SAFE};
 use hashbrown::HashMap;
 use rand::seq::SliceRandom;
 use tokio::{
@@ -25,7 +26,7 @@ use crate::{
 
 pub fn oneshot_send_log_info<T: std::fmt::Debug>(recipient: Sender<T>, msg: T) {
     if let Err(error) = recipient.send(msg) {
-        info!(?error, "");
+        info!(?error);
     }
 }
 
@@ -40,7 +41,6 @@ pub fn render_uri_path_unchecked<'a, 'b>(
 ) -> String {
     let mut r = String::new();
     r.push('/');
-    use base64::engine::{Engine as _, general_purpose::URL_SAFE};
     URL_SAFE.encode_string(info_hash, &mut r);
     for a in path {
         r.push('/');
@@ -705,7 +705,7 @@ impl Disk {
         // Then sequentially takes blocks from this concatenation and returns.
         // Thus HTTP clients have priority.
 
-        debug!(slice_db = ?self.slice_db, "");
+        debug!(slice_db = ?self.slice_db);
         let slice_ranges = self.slice_db.payloads(&info_hash).collect();
         let next_pieces = slices_to_pieces(slice_ranges, piece_len)
             .chain(pieces.iter().cloned())
