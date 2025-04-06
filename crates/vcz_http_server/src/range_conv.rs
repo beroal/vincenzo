@@ -2,7 +2,14 @@
 //! [`Int`] is a trait for integer numbers.
 
 use std::num::Wrapping;
-use std::ops::{Bound::{self, *}, RangeBounds, Add, Sub, Range, RangeInclusive};
+use std::ops::{
+    Bound::{self, Included, Excluded, Unbounded},
+    RangeBounds,
+    Add,
+    Sub,
+    Range,
+    RangeInclusive,
+};
 use num::{traits::{bounds::*, identities::{Zero, One}}, BigInt, BigUint};
 use thiserror::Error;
 
@@ -94,8 +101,16 @@ pub trait TryFromRange<R>: Sized {
 }
 
 #[derive(Debug, Error)]
-#[error("range bounds are out of range")]
-pub struct TryFromRangeError;
+pub enum TryFromRangeError{
+    #[error("the start range bound is too big")]
+    StartBig,
+
+    #[error("the end range bound is too small")]
+    EndSmall,
+
+    #[error("the end range bound is too big")]
+    EndBig,
+}
 
 impl<N, R: RangeBounds<N>> TryFromRange<R> for RangeInclusive<N>
 where
@@ -106,16 +121,16 @@ where
 
     fn try_from_range(range_bounds: R) -> Result<Self, Self::Error> {
         let start = if range_bounds.start_bound() == Excluded(&N::max_value()) {
-             Err(TryFromRangeError)
+             Err(TryFromRangeError::StartBig)
         } else {
             Ok(included_start_bound(range_bounds.start_bound()))
-        };
+        }?;
         let end = if range_bounds.end_bound() == Excluded(&N::min_value()) {
-            Err(TryFromRangeError)
+            Err(TryFromRangeError::EndSmall)
         } else {
             Ok(included_end_bound(range_bounds.end_bound()))
-        };
-        start.and_then(|start| end.map(|end| start.clone() ..= end.clone()))
+        }?;
+        Ok(start ..= end)
     }
 }
 
@@ -126,19 +141,19 @@ where N: Clone + Default + One + Add<Output = N> + Int + Bounded + PartialEq
 
     fn try_from_range(range_bounds: R) -> Result<Self, Self::Error> {
         let start = if range_bounds.start_bound() == Excluded(&N::max_value()) {
-            Err(TryFromRangeError)
+            Err(TryFromRangeError::StartBig)
         } else {
             Ok(included_start_bound(range_bounds.start_bound()))
-        };
+        }?;
         let end_bound = range_bounds.end_bound();
         let is_end_max = end_bound == Unbounded
             || end_bound == Included(&N::max_value());
         let end = if is_end_max {
-            Err(TryFromRangeError)
+            Err(TryFromRangeError::EndBig)
         } else {
             Ok(excluded_end_bound(range_bounds.end_bound()))
-        };
-        start.and_then(|start| end.map(|end| start.clone() .. end.clone()))
+        }?;
+        Ok(start .. end)
     }
 }
 

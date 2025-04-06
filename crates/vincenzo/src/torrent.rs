@@ -336,6 +336,8 @@ impl Torrent {
         Ok(())
     }
 
+    const RECONNECT_FAILED_PEERS_PERIOD: Duration = Duration::from_secs(20);
+
     /// Run the Torrent main event loop to listen to internal [`TorrentMsg`].
     #[tracing::instrument(skip_all)]
     pub async fn run(&mut self) -> Result<(), Error> {
@@ -351,8 +353,8 @@ impl Torrent {
         announce_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         let mut reconnect_failed_peers = interval_at(
-            Instant::now() + Duration::from_secs(20),
-            Duration::from_secs(20),
+            Instant::now() + Self::RECONNECT_FAILED_PEERS_PERIOD,
+            Self::RECONNECT_FAILED_PEERS_PERIOD,
         );
         reconnect_failed_peers.set_missed_tick_behavior(MissedTickBehavior::Delay);
 

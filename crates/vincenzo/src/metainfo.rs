@@ -157,9 +157,9 @@ pub struct File {
 }
 
 impl File {
-    /// Get the len of the given piece in the file, in bytes..
+    /// Get the len of the given piece in the file, in bytes.
     pub fn get_piece_len(&self, piece: u32, piece_length: u32) -> u32 {
-        let b = u64::from(piece) * u64::from(piece_length) + u64::from(piece_length);
+        let b = (u64::from(piece) + 1) * u64::from(piece_length);
         if b <= self.length {
             piece_length
         } else {
