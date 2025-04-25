@@ -1,19 +1,192 @@
 //! Disk is responsible for file I/O of all Torrents.
+pub mod slice;
+
 use std::{
-    collections::VecDeque, io::SeekFrom, path::{Path, PathBuf}, sync::Arc
+    ops::Range, collections::VecDeque, io::SeekFrom, path::{Path, PathBuf}, sync::Arc
 };
 
+use bytes::Bytes;
+use base64::engine::{Engine as _, general_purpose::URL_SAFE};
 use hashbrown::HashMap;
 use rand::seq::SliceRandom;
 use tokio::{
     fs::{create_dir_all, File, OpenOptions}, io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}, sync::{mpsc::Receiver, oneshot::Sender}
 };
-use tracing::{debug, warn};
+use tracing::{debug, warn, info, error};
 
 use crate::{
-    error::Error, metainfo, peer::{PeerCtx, PeerMsg}, tcp_wire::{Block, BlockInfo}, torrent::{TorrentCtx, TorrentMsg}
+    error::Error,
+    metainfo,
+    peer::{PeerCtx, PeerMsg},
+    tcp_wire::{Block, BlockInfo},
+    torrent::{TorrentCtx, TorrentMsg},
+    disk::slice::{InfoHash, SliceId, SliceDb, SliceDbError},
 };
 
+
+pub fn oneshot_send_log_info<T: std::fmt::Debug>(recipient: Sender<T>, msg: T) {
+    if let Err(error) = recipient.send(msg) {
+        info!(?error);
+    }
+}
+
+pub fn range_len(range: Range<u32>) -> u32 {
+    if range.is_empty() { 0 } else { range.end - range.start }
+}
+
+/// Returns the URI path to the torrent file identified by arguments.
+pub fn render_uri_path_unchecked<'a, 'b>(
+    info_hash: &'a InfoHash,
+    path: impl IntoIterator<Item = &'b str>,
+) -> String {
+    let mut r = String::new();
+    r.push('/');
+    URL_SAFE.encode_string(info_hash, &mut r);
+    for a in path {
+        r.push('/');
+        r.push_str(urlencoding::encode(a).as_ref());
+    }
+    r
+}
+
+/// Removes the prefix of length `prefix_len` from `range`.
+/// Returns `None` if `prefix_len` is greater than the length of `range`.
+pub fn range_remove_prefix(range: Range<u64>, prefix_len: u64) -> Option<Range<u64>> {
+    let new_start = range.start + prefix_len;
+    if new_start <= range.end { Some(new_start..range.end) } else { None }
+}
+
+const SLICE_PREFIX_SIZE_LIMIT: u32 = 1u32 << 17;
+
+/// Slice read request.
+#[derive(Debug)]
+pub struct ReadSliceReq {
+    /// The range in the torrent this read request intends to read.
+    ///
+    /// Beware that `block_info` is not required to be
+    /// one of `block_info`s calculated for downloading by this client.
+    /// It's just that [`BlockInfo`] is convenient for slice read requests.
+    pub block_info: BlockInfo,
+
+    pub recipient: Sender<Result<Bytes, SliceError>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SliceError {
+    #[error("a torrent with this info hash is not found")]
+    NoTorrent,
+
+    #[error("no such file path in the torrent")]
+    NoFilePath,
+
+    #[error("no such file index in the torrent")]
+    NoFileIndex,
+
+    #[error("the range in a torrent file is out of bounds")]
+    FileRangeOutOfBounds,
+
+    #[error("slice DB error: {0}")]
+    Db(#[from] SliceDbError),
+
+    #[error("reading of a slice block failed (internal): {0}")]
+    ReadBlock(Error),
+
+    #[error("removing a prefix of the slice failed (internal)")]
+    RemovePrefix,
+}
+
+/// Calculates a prefix of `range` in a torrent suitable for sending it
+/// to a slice reader.
+/// `range.start <= range.end && range.start < piece_len * (u32::MAX + 1)` must hold.
+/// The length of the result will be at most [`SLICE_PREFIX_SIZE_LIMIT`].
+/// The result will be inside a piece.
+/// If `range` is not empty, the result will be not empty.
+///
+/// Beware that if `range` is empty
+/// and at the end of the torrent,
+/// then [`BlockInfo::index`] in the result will be
+/// the number of pieces in the torrent, thus out of bounds.
+fn calc_slice_prefix(
+    range: Range<u64>,
+    piece_len: u32,
+) -> BlockInfo {
+    let piece_len: u64 = piece_len.into();
+    let piece_i: u32 = (range.start / piece_len).try_into().unwrap();
+    let range_in_piece = {
+        let piece_start: u64 = u64::from(piece_i) * piece_len;
+        let start = range.start - piece_start;
+        let end = (range.end - piece_start)
+            .min(piece_len)
+            .min(start + u64::from(SLICE_PREFIX_SIZE_LIMIT));
+        start.try_into().unwrap() .. end.try_into().unwrap()
+    };
+    BlockInfo {
+        index: piece_i,
+        begin: range_in_piece.start,
+        len: range_in_piece.end - range_in_piece.start,
+    }
+}
+
+/// Calculates a list of piece indices in order of decreasing priority
+/// that HTTP clients are interested in.
+/// `ranges` is a list of byte ranges in a torrent
+/// that HTTP clients are interested in.
+/// This function converts every byte range into a piece range
+/// and returns the interleaving of piece ranges.
+/// For example, if the first piece range is `[10, 11, 12, 13, 14]`
+/// and the second piece range is `[8, 9, 10]`,
+/// then the result will be `[10, 8, 11, 9, 12, 10, 13, 14]`.
+/// `range.start <= range.end && range.end < piece_len * u32::MAX` must hold
+/// for every `range` in `ranges`.
+/// The result may contain duplicates.
+fn slices_to_pieces(mut ranges: Vec<&Range<u64>>, piece_len: u32) -> impl Iterator<Item = u32> {
+    let piece_len: u64 = piece_len.into();
+    ranges.sort_by_key(|range| std::cmp::Reverse(range.start % piece_len));
+    let piece_ranges: Vec<Range<u32>> = ranges
+        .into_iter()
+        .map(|range|
+            (range.start / piece_len).try_into().unwrap()
+                .. range.end.div_ceil(piece_len).try_into().unwrap()
+        )
+        .collect();
+    let range_n = piece_ranges.len();
+    let max_range_len = piece_ranges.iter().cloned().map(range_len).max().unwrap_or(0);
+    (0..max_range_len)
+    .flat_map(move |i_in_range| {
+        (0..range_n).map(move |range_i| (i_in_range, range_i))
+    })
+    .filter_map(move |(i_in_range, range_i)| {
+        let range = piece_ranges[range_i].clone();
+        let i = range.start + i_in_range;
+        if i < range.end { Some(i) } else { None }
+    })
+}
+
+/// Global ID of a file in a torrent.
+#[derive(Clone, Debug)]
+pub struct FileId {
+    pub info_hash: InfoHash,
+
+    /// In a multi-file torrent, the index of this file
+    /// in the `files` entry of the `info` entry of the torrent file.
+    /// In a single-file torrent, `0`.
+    pub i: usize,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct FileByPathR {
+    /// [`FileId::i`]
+    pub i: usize,
+
+    /// File size in bytes.
+    pub len: u64,
+}
+
+/// A messages that contains a `recipient` starts a **call**
+/// (send a request, receive a response to this request).
+/// Such a message is a request, and a response is sent
+/// through a oneshot channel the sender part of which is in `recipient`.
+/// If `T` is the type of a response, then `recipient: Sender<T>`.
 #[derive(Debug)]
 pub enum DiskMsg {
     /// After the client downloaded the Info from peers, this message will be
@@ -58,6 +231,32 @@ pub enum DiskMsg {
     /// appended back to the list of available block_infos.
     ReturnBlockInfos([u8; 20], VecDeque<BlockInfo>),
     Quit,
+    /// For the HTTP server.
+    /// Returns the metadata of the file at `path` in the torrent `info_hash`.
+    FileByPath {
+        info_hash: InfoHash,
+        path: Vec<String>,
+        recipient: Sender<Result<FileByPathR, SliceError>>,
+    },
+    /// For the HTTP server.
+    NewSlice {
+        file_id: FileId,
+        range_in_file: Range<u64>,
+        recipient: Sender<Result<SliceId, SliceError>>,
+    },
+    /// For the HTTP server.
+    /// Removes and returns a prefix of the slice.
+    /// For every slice, at most one non-answered read request is allowed.
+    /// If the slice is not empty, the result will be not empty.
+    ReadSlice {
+        slice_id: SliceId,
+        recipient: Sender<Result<Bytes, SliceError>>,
+    },
+    /// For the HTTP server.
+    DropSlice {
+        slice_id: SliceId,
+        recipient: Sender<Result<(), SliceError>>,
+    },
 }
 
 /// The algorithm that determines how pieces are downloaded.
@@ -76,10 +275,12 @@ pub enum PieceStrategy {
     Sequential,
 }
 
-// A metainfo file, but the length is accumulated.
+/// A metainfo file, but the length is accumulated.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct DiskFile {
     path: Vec<String>,
+
+    /// The sum of the lengths of all previous files.
     length: u64,
 }
 
@@ -122,11 +323,20 @@ pub struct Disk {
     cache: HashMap<[u8; 20], Vec<Vec<Block>>>,
     /// k: info_hash
     torrent_info: HashMap<[u8; 20], TorrentInfo>,
-    /// The block infos of each piece of a torrent, ordered from 0 to last.
-    /// where the index of the VecDeque is a piece.
-    /// k: info_hash
+    /// The `BlockInfo`s that are neither downloaded nor being downloaded
+    /// ordered from 0 to last[^note]. Being downloaded means belonging
+    /// to [`Peer::outgoing_requests`](crate::peer::Peer::outgoing_requests).
+    /// Keys: info hash, piece index.
+    ///
+    /// [^note]: beroal: Do they need to be ordered though? The handler
+    ///     of [`DiskMsg::ReturnBlockInfos`] does not insert them in order.
     pieces_blocks: HashMap<[u8; 20], Vec<VecDeque<BlockInfo>>>,
     rx: Receiver<DiskMsg>,
+    /// Slices of HTTP connections. The parameters of `SliceDb` are:
+    ///
+    /// - range in the torrent the slice belongs to
+    /// - slice read request.
+    slice_db: SliceDb<Range<u64>, ReadSliceReq>,
 }
 
 impl Disk {
@@ -143,6 +353,7 @@ impl Disk {
             pieces_blocks: HashMap::default(),
             torrent_info: HashMap::default(),
             pieces: HashMap::default(),
+            slice_db: Default::default(),
         }
     }
 
@@ -153,7 +364,7 @@ impl Disk {
             match msg {
                 DiskMsg::NewTorrent(torrent) => {
                     debug!("NewTorrent");
-                    let _ = self.new_torrent(torrent).await;
+                    let _ = self.new_torrent(torrent).await?;
                 }
                 DiskMsg::ReadBlock { block_info, recipient, info_hash } => {
                     debug!("ReadBlock");
@@ -200,7 +411,7 @@ impl Disk {
                     self.new_peer(peer).await?;
                 }
                 DiskMsg::ReturnBlockInfos(info_hash, block_infos) => {
-                    debug!("ReturnBlockInfos");
+                    debug!(?block_infos, "ReturnBlockInfos");
                     for block in block_infos {
                         // get vector of piece_blocks for each
                         // piece of the blocks.
@@ -213,11 +424,26 @@ impl Disk {
                             piece.push_back(block);
                         }
                     }
+                    self
+                        .torrent_ctxs
+                        .get(&info_hash)
+                        .unwrap()
+                        .tx
+                        .send(TorrentMsg::BlockAvailable)
+                        .await?;
                 }
                 DiskMsg::Quit => {
                     debug!("Quit");
                     return Ok(());
                 }
+                DiskMsg::FileByPath { info_hash, path, recipient } =>
+                    self.file_by_path(info_hash, path, recipient).await,
+                DiskMsg::NewSlice { file_id, range_in_file, recipient } =>
+                    self.new_slice(file_id, range_in_file, recipient).await,
+                DiskMsg::ReadSlice { slice_id, recipient } =>
+                    self.read_slice(slice_id, recipient).await,
+                DiskMsg::DropSlice { slice_id, recipient } =>
+                    self.drop_slice(slice_id, recipient).await,
             }
         }
 
@@ -236,10 +462,30 @@ impl Disk {
         let info_hash = torrent_ctx.info_hash;
         debug!("new_torrent {info_hash:?}");
 
+        if self.torrent_ctxs.contains_key(&info_hash) {
+            return Err(Error::NoDuplicateTorrent);
+        }
+
         self.torrent_ctxs.insert(info_hash, torrent_ctx);
 
         let torrent_ctx = self.torrent_ctxs.get(&info_hash).unwrap();
         let info = torrent_ctx.info.read().await;
+
+        /* A crutch to tell a user of URL paths to torrent files
+        exposed by the HTTP server. */
+        if let Some(files) = &info.files {
+            for file in files {
+                info!(
+                    "ui_uri_path={}",
+                    render_uri_path_unchecked(&info_hash, file.path.iter().map(|s| s.as_ref())),
+                );
+            }
+        } else {
+            info!(
+                "ui_uri_path={}",
+                render_uri_path_unchecked(&info_hash, std::iter::once(info.name.as_ref())),
+            );
+        }
 
         let mut disk_files = Vec::new();
 
@@ -257,7 +503,7 @@ impl Disk {
         } else {
             disk_files.push(DiskFile {
                 path: vec![info.name.clone()],
-                length: info.file_length.unwrap() as u64,
+                length: 0,
             });
         }
 
@@ -268,33 +514,31 @@ impl Disk {
                 total_size: info.get_size(),
                 piece_length: info.piece_length,
                 pieces: info.pieces(),
-                files: disk_files,
+                files: disk_files.clone(),
             },
         );
 
         let base = self.base_path(info_hash);
 
         // create "skeleton" of the torrent, empty files and directories
-        if let Some(files) = info.files.clone() {
-            for mut file in files {
-                // extract the file, the last item of the vec
-                // file.txt
-                let last = file.path.pop();
+        for mut file in disk_files {
+            // extract the file, the last item of the vec
+            // file.txt
+            let last = file.path.pop();
 
-                // the directory of the current file
-                // download_dir/name_of_torrent/name_of_dir
-                let mut file_dir = base.clone();
-                for dir_path in file.path {
-                    file_dir.push(&dir_path);
-                }
+            // the directory of the current file
+            // download_dir/name_of_torrent/name_of_dir
+            let mut file_dir = base.clone();
+            for dir_path in file.path {
+                file_dir.push(&dir_path);
+            }
 
-                create_dir_all(&file_dir).await?;
+            create_dir_all(&file_dir).await?;
 
-                // now with the dirs created, we create the file
-                if let Some(file_ext) = last {
-                    file_dir.push(file_ext);
-                    Self::open_file(file_dir).await?;
-                }
+            // now with the dirs created, we create the file
+            if let Some(file_ext) = last {
+                file_dir.push(file_ext);
+                Self::open_file(file_dir).await?;
             }
         }
 
@@ -353,45 +597,6 @@ impl Disk {
     ) -> Result<(), Error> {
         self.peer_ctxs.insert(peer_ctx.id, peer_ctx);
         Ok(())
-    }
-
-    /// The function will get the next available piece
-    /// based on the following criteria:
-    ///
-    /// - it will respect `PieceStrategy`.
-    /// - the peer must have the piece (the bit is set to 1 on it's bitfield).
-    /// - the local peer (client) doesn't have the piece downloaded.
-    ///
-    /// # Return
-    /// if `Disk` does not have the peer_ctx of the given peer_id, it will
-    /// return None.
-    async fn next_piece(
-        &self,
-        info_hash: [u8; 20],
-        peer_id: [u8; 20],
-    ) -> Option<(usize, u32)> {
-        let peer_ctx = self.peer_ctxs.get(&peer_id);
-        peer_ctx?;
-        let peer_pieces = peer_ctx.unwrap().pieces.read().await;
-        let downloaded_pieces = self.downloaded_pieces.get(&info_hash).unwrap();
-        self.pieces
-            .get(&info_hash)
-            .unwrap()
-            .iter()
-            .enumerate()
-            .find(|(_, piece)| {
-                if let Some(has_piece) = peer_pieces.get(**piece as usize) {
-                    if *has_piece
-                        && *downloaded_pieces.get(**piece as usize).unwrap()
-                            < self.piece_size(info_hash, **piece as usize)
-                                as u64
-                    {
-                        return true;
-                    }
-                }
-                false
-            })
-            .map(|(i, x)| (i, x.to_owned()))
     }
 
     /// Change the piece download algorithm to rarest-first.
@@ -477,36 +682,82 @@ impl Disk {
         qnt: usize,
     ) -> Result<VecDeque<BlockInfo>, Error> {
         let mut result: VecDeque<BlockInfo> = VecDeque::new();
+        let piece_len = self.torrent_info.get(&info_hash).unwrap().piece_length;
+        let peer_ctx = self
+            .peer_ctxs
+            .get(&peer_id)
+            .ok_or(Error::PeerIdInvalid)?;
+        let peer_pieces = peer_ctx.pieces.read().await;
+        let pieces = self
+            .pieces
+            .get(&info_hash)
+            .ok_or(Error::TorrentDoesNotExist)?;
+        let torrent_ctx = self
+            .torrent_ctxs
+            .get(&info_hash)
+            .ok_or(Error::TorrentDoesNotExist)?;
+        let bitfield = torrent_ctx.bitfield.read().await;
+        let is_downloaded = |index| bitfield.get(index);
 
-        for _ in 0..qnt {
-            let next_piece = self.next_piece(info_hash, peer_id).await;
+        // Calculates the concatenation of:
+        //
+        // - the list of pieces that HTTP clients are interested in;
+        // - [`self::pieces`] for this torrent
+        //   (inherent choice of pieces by this client).
+        //
+        // Then sequentially takes blocks from this concatenation and returns.
+        // Thus HTTP clients have priority.
 
-            if let Some(piece) = next_piece {
-                let pieces_blocks =
-                    self.pieces_blocks.get_mut(&info_hash).unwrap();
-                let blocks = pieces_blocks.get_mut(piece.1 as usize);
-
-                if let Some(blocks) = blocks {
-                    if blocks.is_empty() {
-                        debug!(
-                            "piece {} is empty, removing by index {}",
-                            piece.1, piece.0
-                        );
-                        // pieces_blocks.remove(piece.1 as usize);
-                        self.pieces
-                            .get_mut(&info_hash)
-                            .unwrap()
-                            .remove(piece.0);
+        debug!(slice_db = ?self.slice_db);
+        let slice_ranges = self.slice_db.payloads(&info_hash).collect();
+        let next_pieces = slices_to_pieces(slice_ranges, piece_len)
+            .chain(pieces.iter().cloned())
+            .filter(|piece| {
+                let piece = *piece as usize;
+                if let Some(has_piece) = peer_pieces.get(piece) {
+                    if *has_piece && !*is_downloaded(piece).unwrap()
+                    {
+                        return true;
                     }
-                    // how many blocks are left to request
-                    let left = qnt - result.len();
-                    result.extend(blocks.drain(0..left.min(blocks.len())));
                 }
+                false
+            });
+
+        for piece in next_pieces {
+            // how many blocks are left to request
+            let left = qnt - result.len();
+
+            if left == 0 {
+                break;
             }
 
-            if result.len() >= qnt {
-                break;
-            };
+            let pieces_blocks =
+                self.pieces_blocks.get_mut(&info_hash).unwrap();
+            let blocks = pieces_blocks.get_mut(piece as usize);
+
+            if let Some(blocks) = blocks {
+                /* You shouldn't remove the piece from `self.pieces` here.
+                Even if `self` does not store any of the piece's blocks,
+                the piece's blocks may be stored in a `Peer`.
+                If the peer disconnects, those blocks would be returned
+                to `self`. Instead, delete the piece when it is downloaded
+                and validated against a hash.
+
+                if blocks.is_empty() {
+                    debug!(
+                        "piece {} is empty, removing by index {}",
+                        piece.1, piece.0
+                    );
+                    // pieces_blocks.remove(piece.1 as usize);
+                    self.pieces
+                        .get_mut(&info_hash)
+                        .unwrap()
+                        .remove(piece.0);
+                } */
+
+                debug!(piece, block_n = blocks.len(), "result candidate piece");
+                result.extend(blocks.drain(0..left.min(blocks.len())));
+            }
         }
         debug!("result len {:?}", result.len());
 
@@ -561,15 +812,20 @@ impl Disk {
     /// If the download algorithm of the pieces is set to "Random", and this
     /// function has downloaded it's first full piece, it will change the
     /// algorithm to rarest-first.
-    #[tracing::instrument(skip(self, block))]
+    #[tracing::instrument(skip_all)]
     pub async fn write_block(
         &mut self,
         info_hash: [u8; 20],
         block: Block,
     ) -> Result<(), Error> {
         // Write the block's data to the correct position in the file
+
+        debug!(?info_hash, block_info = ?BlockInfo::from(&block), "write_block enter");
+
         let len = block.block.len();
         let index = block.index;
+
+        let piece_size = self.piece_size(info_hash, index);
 
         let torrent_ctx = self
             .torrent_ctxs
@@ -577,68 +833,145 @@ impl Disk {
             .ok_or(Error::TorrentDoesNotExist)?
             .clone();
 
+        if *torrent_ctx.bitfield.read().await.get(index).ok_or(Error::PieceIndexInvalid)? {
+            // We don't need this block because the piece the blocks belongs to
+            // was downloaded earlier.
+            return Err(Error::PieceDownloaded);
+        }
+
         let torrent_tx = torrent_ctx.tx.clone();
 
-        self.cache.get_mut(&info_hash).ok_or(Error::TorrentDoesNotExist)?
-            [index]
-            .push(block);
-
-        let _ =
-            torrent_tx.send(TorrentMsg::IncrementDownloaded(len as u32)).await;
-
-        let downloaded_piece_bytes = self
-            .downloaded_pieces
+        // Don't add a duplicate block.
+        let cache_blocks: &mut Vec<Block> = &mut self
+            .cache
             .get_mut(&info_hash)
             .ok_or(Error::TorrentDoesNotExist)?
-            .get_mut(index)
-            .unwrap();
+            [index];
+        let does_exist = cache_blocks
+            .iter()
+            .any(|block1| BlockInfo::from(block1) == BlockInfo::from(&block));
+        if !does_exist {
+            cache_blocks.push(block);
+        }
 
-        *downloaded_piece_bytes += len as u64;
+        let downloaded_piece_bytes = {
+            let p = self
+                .downloaded_pieces
+                .get_mut(&info_hash)
+                .ok_or(Error::TorrentDoesNotExist)?
+                .get_mut(index)
+                .unwrap();
+
+            let new = *p + len as u64;
+            *p = new;
+            new
+        };
 
         // Check if the entire piece of the `block` has been downloaded
-        if *downloaded_piece_bytes >= self.piece_size(info_hash, index) as u64 {
-            let downloaded_pieces_len = self
-                .downloaded_pieces_len
-                .get_mut(&info_hash)
-                .ok_or(Error::TorrentDoesNotExist)?;
-
-            *downloaded_pieces_len += 1;
-
-            if *downloaded_pieces_len == 1 {
-                let piece_order = self
-                    .piece_strategy
-                    .get(&info_hash)
-                    .ok_or(Error::TorrentDoesNotExist)?;
-
-                if *piece_order == PieceStrategy::Random {
-                    debug!("first piece downloaded, and piece order is random, switching to rarest-first");
-                    self.rarest_first(info_hash).await?;
-                }
-            }
-
+        if downloaded_piece_bytes >= piece_size as u64 {
             // validate that the downloaded pieces hash
             // matches the hash of the info.
             let piece_validation = self.validate_piece(info_hash, index).await;
             match piece_validation {
-                Ok(_) => {
+                Ok(()) => {
                     debug!("Piece {index} is valid.");
+
+                    // at this point the piece is valid,
+                    // get the file path of all the blocks,
+                    // and then write all bytes into the files.
+                    self.write_pieces(info_hash, index.try_into().unwrap()).await?;
 
                     let mut bitfield = torrent_ctx.bitfield.write().await;
                     bitfield.set(index, true);
 
+                    self
+                        .pieces
+                        .get_mut(&info_hash)
+                        .ok_or(Error::TorrentDoesNotExist)?
+                        .retain(|piece_i| usize::try_from(*piece_i).unwrap() != index);
+
+                    let downloaded_pieces_len = self
+                        .downloaded_pieces_len
+                        .get_mut(&info_hash)
+                        .ok_or(Error::TorrentDoesNotExist)?;
+
+                    *downloaded_pieces_len += 1;
+
+                    if *downloaded_pieces_len == 1 {
+                        let piece_order = self
+                            .piece_strategy
+                            .get(&info_hash)
+                            .ok_or(Error::TorrentDoesNotExist)?;
+
+                        if *piece_order == PieceStrategy::Random {
+                            debug!("first piece downloaded, and piece order is random, \
+                                switching to rarest-first");
+                            self.rarest_first(info_hash).await?;
+                        }
+                    }
+
+                    // Answers slice read requests in the queue in [`Self::slice_db`].
+                    match self.slice_db.remove_read_reqs(&(info_hash, index.try_into().unwrap())) {
+                        Err(error) => error!(
+                            ?error,
+                            "when removing slice read requests after downloading a piece",
+                        ),
+                        Ok(read_slice_reqs) => for entry in read_slice_reqs {
+                            let (slice_id, _, ReadSliceReq { block_info, recipient }) = entry;
+                            self.send_slice_block(slice_id, block_info, recipient).await
+                        },
+                    }
+
                     let _ = torrent_tx
                         .send(TorrentMsg::DownloadedPiece(index))
                         .await;
+
+                    let _ = torrent_tx
+                        .send(TorrentMsg::IncrementDownloaded(piece_size))
+                        .await;
                 }
                 Err(_) => {
+                    // Revert the downloading of the piece.
+
+                    let cache_blocks: Vec<_> = self
+                        .cache
+                        .get_mut(&info_hash)
+                        .ok_or(Error::TorrentDoesNotExist)?
+                        [index]
+                        .drain(..)
+                        .collect();
+                    let ref_blocks: &mut VecDeque<BlockInfo> = self
+                        .pieces_blocks
+                        .get_mut(&info_hash)
+                        .unwrap()
+                        .get_mut(index)
+                        .unwrap();
+                    if !ref_blocks.is_empty() {
+                        error!(
+                            piece_index = index,
+                            ?ref_blocks,
+                            "pieces_blocks for this piece is not empty"
+                        );
+                        ref_blocks.clear();
+                    }
+                    let mut blocks = cache_blocks
+                        .into_iter()
+                        .map(|block| BlockInfo::from(&block))
+                        .collect::<Vec<_>>();
+                    blocks.sort();
+                    ref_blocks.extend(blocks.into_iter());
+
+                    let downloaded_piece_bytes = self
+                        .downloaded_pieces
+                        .get_mut(&info_hash)
+                        .ok_or(Error::TorrentDoesNotExist)?
+                        .get_mut(index)
+                        .unwrap();
+                    *downloaded_piece_bytes = 0;
+
                     warn!("Piece {index} is corrupted.");
                 }
             }
-
-            // at this point the piece is valid,
-            // get the file path of all the blocks,
-            // and then write all bytes into the files.
-            self.write_pieces(info_hash, index).await?;
         }
 
         Ok(())
@@ -692,6 +1025,7 @@ impl Disk {
 
             Err(Error::FileOpenError("Offset exceeds file sizes".to_owned()))
         } else {
+            path.push(&info.name);
             let mut file = Self::open_file(path).await?;
             file.seek(SeekFrom::Start(absolute_offset)).await?;
 
@@ -892,6 +1226,7 @@ impl Disk {
 
         Ok(())
     }
+
     /// Get the correct piece size, the last piece of a torrent
     /// might be smaller than the other pieces.
     fn piece_size(&self, info_hash: [u8; 20], piece_index: usize) -> u32 {
@@ -914,6 +1249,205 @@ impl Disk {
         let mut base = PathBuf::from(&self.download_dir);
         base.push(&info.name);
         base
+    }
+
+    /// Calculates a response message.
+    async fn file_by_path_msg(
+        &mut self,
+        info_hash: InfoHash,
+        path: Vec<String>,
+    ) -> Result<FileByPathR, SliceError> {
+        let torrent_ctx = self
+            .torrent_ctxs
+            .get(&info_hash)
+            .ok_or(SliceError::NoTorrent)?
+            .clone();
+        let file_attr = {
+            let info = torrent_ctx.info.read().await;
+            if let Some(files) = &info.files {
+                files
+                    .iter()
+                    .enumerate()
+                    .find(|(_, file)| file.path == path)
+                    .map(|(i, file)| FileByPathR { i, len: file.length.into() })
+            } else {
+                if path.len() == 1 && path[0] == info.name {
+                    Some(FileByPathR { i: 0, len: info.file_length.unwrap().into() })
+                } else { None }
+            }
+        };
+        file_attr.ok_or(SliceError::NoFilePath)
+    }
+
+    async fn file_by_path(
+        &mut self,
+        info_hash: InfoHash,
+        path: Vec<String>,
+        recipient: Sender<Result<FileByPathR, SliceError>>,
+    ) {
+        oneshot_send_log_info(recipient, self.file_by_path_msg(info_hash, path).await);
+    }
+
+    /// Calculates a response message.
+    async fn new_slice_msg(
+        &mut self,
+        file_id: FileId,
+        mut range_in_file: Range<u64>,
+    ) -> Result<SliceId, SliceError> {
+        if range_in_file.end < range_in_file.start {
+            range_in_file.end = range_in_file.start;
+        }
+        let info_hash = &file_id.info_hash;
+        let file_i = file_id.i;
+        let torrent_info = self
+            .torrent_info
+            .get(info_hash)
+            .ok_or(SliceError::NoTorrent)?;
+        let file_start: u64 = torrent_info
+            .files
+            .get(file_i)
+            .ok_or(SliceError::NoFileIndex)?
+            .length
+            .into();
+        let torrent_ctx = self
+            .torrent_ctxs
+            .get(info_hash)
+            .ok_or(SliceError::NoTorrent)?
+            .clone();
+        let file_length = {
+            let info = torrent_ctx.info.read().await;
+            if let Some(files) = &info.files {
+                files.get(file_i).map(|file| file.length)
+            } else {
+                if file_i == 0 { Some(info.file_length.unwrap()) } else { None }
+            }
+        };
+        let file_length: u64 = file_length.ok_or(SliceError::NoFileIndex)?.into();
+        if range_in_file.end > file_length {
+            Err(SliceError::FileRangeOutOfBounds)
+        } else {
+            // The range in the torrent representing the same set
+            // as `range_in_file` in the file `file_id`.
+            let range = file_start + range_in_file.start .. file_start + range_in_file.end;
+            Ok(self.slice_db.insert(file_id.info_hash, range)?)
+        }
+    }
+
+    async fn new_slice(
+        &mut self,
+        file_id: FileId,
+        range_in_file: Range<u64>,
+        recipient: Sender<Result<SliceId, SliceError>>,
+    ) {
+        oneshot_send_log_info(recipient, self.new_slice_msg(file_id, range_in_file).await);
+    }
+
+    /// Calculates a response to a read request
+    /// for the region `block_info` of the slice `slice_id`.
+    /// `block_info` must be a prefix of the slice.
+    /// Removes `block_info` from the slice.
+    async fn send_slice_block_msg(
+        &mut self,
+        slice_id: SliceId,
+        block_info: BlockInfo,
+    ) -> Result<Bytes, SliceError> {
+        let block_len = block_info.len;
+        let info_hash = self.slice_db.get(slice_id).ok_or(SliceDbError::NoSlice)?.get_info_hash();
+        let chunk = self
+            .read_block(info_hash.clone(), block_info)
+            .await
+            .map_err(SliceError::ReadBlock)?;
+        let range = self.slice_db.get_mut(slice_id).ok_or(SliceDbError::NoSlice)?.get_payload_mut();
+        *range = range_remove_prefix(range.clone(), block_len.into())
+            .ok_or(SliceError::RemovePrefix)?;
+        Ok(chunk.into())
+    }
+
+    async fn send_slice_block(
+        &mut self,
+        slice_id: SliceId,
+        block_info: BlockInfo,
+        recipient: Sender<Result<Bytes, SliceError>>,
+    ) {
+        let msg = self.send_slice_block_msg(slice_id, block_info).await;
+        oneshot_send_log_info(recipient, msg);
+    }
+
+    /// Calculates a response to a read slice request.
+    /// Suppose it returns `Ok(a)`.
+    /// If `a` is `None`, the response content chunk is empty.
+    /// If `a` is `Some((is_downloaded, block_info))`,
+    /// `block_info` describes the response content chunk,
+    /// `is_downloaded` is whether the piece
+    /// which the response content chunk belongs to is downloaded,
+    /// and `block_info` is not empty.
+    #[tracing::instrument(skip(self), ret)]
+    async fn read_slice_msg(
+        &self,
+        slice_id: SliceId,
+    ) -> Result<Option<(bool, BlockInfo)>, SliceError> {
+        let attr = self.slice_db.get(slice_id).ok_or(SliceDbError::NoSlice)?;
+        let info_hash = attr.get_info_hash();
+        let range = attr.get_payload();
+
+        let piece_length: u32 = self
+            .torrent_info
+            .get(info_hash)
+            .ok_or(SliceError::NoTorrent)?
+            .piece_length;
+
+        Ok(if range.is_empty() {
+            None
+        } else {
+            let block_info = calc_slice_prefix(range.clone(), piece_length);
+            let torrent_ctx = self
+                .torrent_ctxs
+                .get(info_hash)
+                .ok_or(SliceError::NoTorrent)?;
+            let is_downloaded: bool = *torrent_ctx
+                .bitfield
+                .read()
+                .await
+                .get(usize::try_from(block_info.index).unwrap())
+                .unwrap();
+            Some((is_downloaded, block_info))
+        })
+    }
+
+    async fn read_slice(
+        &mut self,
+        slice_id: SliceId,
+        recipient: Sender<Result<Bytes, SliceError>>,
+    ) {
+        match self.read_slice_msg(slice_id).await {
+            Err(e) => oneshot_send_log_info(recipient, Err(e)),
+            Ok(a) => match a {
+                None => oneshot_send_log_info(recipient, Ok(Default::default())),
+                Some((is_downloaded, block_info)) => if is_downloaded {
+                    // Answers with the prefix of the slice immediately.
+                    oneshot_send_log_info(
+                        recipient,
+                        self.send_slice_block_msg(slice_id, block_info).await,
+                    )
+                } else {
+                    // Inserts the read request into the queue.
+                    let piece_i = block_info.index;
+                    let req = ReadSliceReq { block_info, recipient };
+                    match self.slice_db.insert_read_req(slice_id, piece_i, req) {
+                        Ok(()) => {},
+                        Err((req, e)) => oneshot_send_log_info(req.recipient, Err(e.into())),
+                    }
+                },
+            },
+        }
+    }
+
+    async fn drop_slice(
+        &mut self,
+        slice_id: SliceId,
+        recipient: Sender<Result<(), SliceError>>,
+    ) {
+        oneshot_send_log_info(recipient, self.slice_db.remove(slice_id).map_err(Into::into));
     }
 }
 
@@ -1501,5 +2035,23 @@ mod tests {
         assert!(result.is_ok());
 
         tokio::fs::remove_dir_all(&download_dir).await.unwrap();
+    }
+
+    use super::{INFO_HASH_BYTE_N_USIZE, SliceDb};
+
+    #[test]
+    fn slices_to_pieces() {
+        let info_hash = [55; INFO_HASH_BYTE_N_USIZE];
+        let mut slice_db: SliceDb = Default::default();
+        let (drop_tx, drop_rx) = tokio::sync::oneshot::channel();
+        slice_db.insert(info_hash, 25..80, drop_tx).unwrap();
+        let (drop_tx, drop_rx) = tokio::sync::oneshot::channel();
+        slice_db.insert(info_hash, 48..60, drop_tx).unwrap();
+        let (drop_tx, drop_rx) = tokio::sync::oneshot::channel();
+        slice_db.insert(info_hash, 64..139, drop_tx).unwrap();
+        assert!(
+            slice_db.slices_to_pieces(&info_hash, 10)
+                .eq(vec![4, 2, 6, 5, 3, 7, 4, 8, 5, 9, 6, 10, 7, 11, 12, 13])
+        );
     }
 }

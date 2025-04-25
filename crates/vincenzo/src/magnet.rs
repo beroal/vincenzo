@@ -1,31 +1,60 @@
 //! Handle magnet link
 use std::ops::{Deref, DerefMut};
+use std::net::{SocketAddr, AddrParseError};
 
 use magnet_url::Magnet as Magnet_;
 
 use crate::error::Error;
 
 #[derive(Debug, Clone, Hash)]
-pub struct Magnet(Magnet_);
+pub struct Magnet {
+    inner: Magnet_,
+    x_pe: Vec<SocketAddr>,
+}
 
 impl Deref for Magnet {
     type Target = Magnet_;
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.inner
     }
 }
 
 impl DerefMut for Magnet {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.inner
+    }
+}
+
+#[derive(thiserror::Error, Debug)]
+enum XPeError {
+    #[error("when parsing a magnet URI")]
+    Uri(#[from] uriparse::URIError),
+
+    #[error("when parsing a peer address")]
+    Address(#[from] AddrParseError),
+}
+
+fn parse_x_pe(magnet_url: &str) -> Result<Vec<SocketAddr>, XPeError> {
+    let uri = uriparse::uri::URI::try_from(magnet_url)?;
+    match uri.query() {
+        None => Ok(Default::default()),
+        Some(query) => {
+            let iter = form_urlencoded::parse(query.as_ref())
+                .filter_map(|(key, value)|
+                    if key == "x.pe" { Some(value.parse()) } else { None }
+                );
+            let r: Result<Vec<std::net::SocketAddr>, _> = Result::from_iter(iter);
+            Ok(r?)
+        },
     }
 }
 
 impl Magnet {
     pub fn new(magnet_url: &str) -> Result<Self, Error> {
-        Ok(Self(
-            Magnet_::new(magnet_url).map_err(|_| Error::MagnetLinkInvalid)?,
-        ))
+        Ok(Self {
+            inner: Magnet_::new(magnet_url).map_err(|_| Error::MagnetLinkInvalid)?,
+            x_pe: parse_x_pe(magnet_url).map_err(|_| Error::MagnetLinkInvalid)?,
+        })
     }
 
     /// The name will come URL encoded, and it is also optional.
@@ -67,5 +96,14 @@ impl Magnet {
             })
             .collect();
         tr
+    }
+
+    /// Peer addresses. The values associated with `x.pe` entries
+    /// in the query of the magnet URI.
+    /// See the chapter “magnet URI format”
+    /// in [BEP 9](https://bittorrent.org/beps/bep_0009.html)
+    /// or [“Magnet URI scheme”](https://en.wikipedia.org/wiki/Magnet_URI_scheme#Format).
+    pub fn parse_x_pe(&self) -> &Vec<SocketAddr> {
+        &self.x_pe
     }
 }

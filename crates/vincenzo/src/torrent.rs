@@ -5,12 +5,17 @@ use crate::{
 use bendy::decoding::FromBencode;
 use bitvec::{bitvec, prelude::Msb0};
 use hashbrown::HashMap;
+use rand::prelude::SliceRandom;
 use speedy::{Readable, Writable};
 use std::{
     collections::BTreeMap, net::SocketAddr, sync::{atomic::AtomicBool, Arc}, time::Duration
 };
 use tokio::{
-    net::{TcpListener, TcpStream}, select, spawn, sync::{mpsc, oneshot, RwLock}, time::{interval, interval_at, Instant}
+    net::{TcpListener, TcpStream},
+    select,
+    spawn,
+    sync::{mpsc, oneshot, RwLock},
+    time::{interval, interval_at, Instant, MissedTickBehavior},
 };
 use tracing::{debug, info, warn};
 
@@ -50,6 +55,8 @@ pub enum TorrentMsg {
     TogglePause,
     /// When we can't do a TCP connection with the ip of the Peer.
     FailedPeer(SocketAddr),
+    /// A block has become available for downloading in the disk.
+    BlockAvailable,
     /// When torrent is being gracefully shutdown
     Quit,
 }
@@ -207,8 +214,14 @@ impl Torrent {
     pub async fn start_and_run(
         &mut self,
         listen: Option<SocketAddr>,
+        no_tracker: bool,
     ) -> Result<(), Error> {
-        let peers = self.start(listen).await?;
+        let mut peers = if no_tracker {
+            Default::default()
+        } else {
+            self.start(listen).await?
+        };
+        peers.extend(self.ctx.magnet.parse_x_pe());
 
         self.spawn_outbound_peers(peers).await?;
         self.spawn_inbound_peers().await?;
@@ -281,7 +294,7 @@ impl Torrent {
         // might be shutting down due to an error or this is malicious peer
         // that we wish to end the connection.
         if peer.session.state.connection != ConnectionState::Quitting {
-            peer.free_pending_blocks().await;
+            peer.free_pending_blocks().await?;
         }
 
         Ok(peer)
@@ -323,6 +336,8 @@ impl Torrent {
         Ok(())
     }
 
+    const RECONNECT_FAILED_PEERS_PERIOD: Duration = Duration::from_secs(20);
+
     /// Run the Torrent main event loop to listen to internal [`TorrentMsg`].
     #[tracing::instrument(skip_all)]
     pub async fn run(&mut self) -> Result<(), Error> {
@@ -335,11 +350,13 @@ impl Torrent {
                 + Duration::from_secs(self.stats.interval.max(500).into()),
             Duration::from_secs((self.stats.interval as u64).max(500)),
         );
+        announce_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         let mut reconnect_failed_peers = interval_at(
-            Instant::now() + Duration::from_secs(5),
-            Duration::from_secs(5),
+            Instant::now() + Self::RECONNECT_FAILED_PEERS_PERIOD,
+            Self::RECONNECT_FAILED_PEERS_PERIOD,
         );
+        reconnect_failed_peers.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         let mut frontend_interval = interval(Duration::from_secs(1));
 
@@ -422,75 +439,93 @@ impl Torrent {
                         }
                         TorrentMsg::DownloadedInfoPiece(total, index, bytes) => {
                             debug!("received DownloadedInfoPiece");
-
-                            if self.status == TorrentStatus::ConnectingTrackers {
-                                self.status = TorrentStatus::DownloadingMetainfo;
-                            }
-
-                            self.info_pieces.insert(index, bytes);
-
-                            let info_len = self.info_pieces.values().fold(0, |acc, b| {
-                                acc + b.len()
-                            });
-
-                            let have_all_pieces = info_len as u32 >= total;
-
-                            if have_all_pieces {
-                                // info has a valid bencode format
-                                let info_bytes = self.info_pieces.values().fold(Vec::new(), |mut acc, b| {
-                                    acc.extend_from_slice(b);
-                                    acc
-                                });
-                                let info = Info::from_bencode(&info_bytes).map_err(|_| Error::BencodeError)?;
-
-                                let m_info = self.ctx.magnet.xt.clone().unwrap();
-
-                                let mut hash = sha1_smol::Sha1::new();
-                                hash.update(&info_bytes);
-
-                                let hash = hash.digest().bytes();
-
-                                // validate the hash of the downloaded info
-                                // against the hash of the magnet link
-                                let hash = hex::encode(hash);
-
-                                if hash.to_uppercase() == m_info.to_uppercase() {
-                                    debug!("the hash of the downloaded info matches the hash of the magnet link");
-
-                                    // with the info fully downloaded, we now know the pieces len,
-                                    // this will update the bitfield of the torrent
-                                    let mut bitfield = self.ctx.bitfield.write().await;
-                                    *bitfield = bitvec![u8, Msb0; 0; info.pieces() as usize];
-
-                                    // remove excess bits
-                                    if (info.pieces() as usize) < bitfield.len() {
-                                        unsafe {
-                                            bitfield.set_len(info.pieces() as usize);
-                                        }
-                                    }
-
-                                    debug!("local_bitfield is now of len {:?}", bitfield.len());
-
-                                    self.size = info.get_size();
-                                    self.have_info = true;
-
-                                    let mut info_l = self.ctx.info.write().await;
-
-                                    debug!("new info piece length {:?}", info.piece_length);
-                                    debug!("new info pieces_len {:?}", info.pieces.len());
-                                    debug!("new info pieces_len {:?}", info.pieces.len());
-                                    debug!("new info file_length {:?}", info.file_length);
-                                    debug!("new info files {:#?}", info.files);
-
-                                    *info_l = info;
-                                    drop(info_l);
-
-                                    self.status = TorrentStatus::Downloading;
-                                    self.ctx.disk_tx.send(DiskMsg::NewTorrent(self.ctx.clone())).await?;
-                                } else {
-                                    warn!("a peer sent a valid Info, but the hash does not match the hash of the provided magnet link, panicking");
-                                    return Err(Error::PieceInvalid);
+                            // Without the following `if`, we send multiple `DiskMsg::NewTorrent`s.
+                            if self.status == TorrentStatus::ConnectingTrackers
+                                || self.status == TorrentStatus::DownloadingMetainfo
+                            {
+                                if self.status == TorrentStatus::ConnectingTrackers {
+                                    self.status = TorrentStatus::DownloadingMetainfo;
                                 }
+
+                                self.info_pieces.insert(index, bytes);
+
+                                let info_len = self.info_pieces.values().fold(0, |acc, b| {
+                                    acc + b.len()
+                                });
+
+                                let have_all_pieces = info_len as u32 >= total;
+
+                                if have_all_pieces {
+                                    // info has a valid bencode format
+                                    let info_bytes = self
+                                        .info_pieces
+                                        .values()
+                                        .fold(Vec::new(), |mut acc, b| {
+                                            acc.extend_from_slice(b);
+                                            acc
+                                        });
+                                    let info = Info::from_bencode(&info_bytes)
+                                        .map_err(|error| {
+                                            info!(
+                                                ?error,
+                                                "when decoding a metainfo file obtained from a peer",
+                                            );
+                                            Error::BencodeError
+                                        })?;
+
+                                    let m_info = self.ctx.magnet.xt.clone().unwrap();
+
+                                    let mut hash = sha1_smol::Sha1::new();
+                                    hash.update(&info_bytes);
+
+                                    let hash = hash.digest().bytes();
+
+                                    // validate the hash of the downloaded info
+                                    // against the hash of the magnet link
+                                    let hash = hex::encode(hash);
+
+                                    if hash.to_uppercase() == m_info.to_uppercase() {
+                                        debug!("the hash of the downloaded info \
+                                            matches the hash of the magnet link");
+
+                                        // with the info fully downloaded, we now know the pieces len,
+                                        // this will update the bitfield of the torrent
+                                        let mut bitfield = self.ctx.bitfield.write().await;
+                                        *bitfield = bitvec![u8, Msb0; 0; info.pieces() as usize];
+
+                                        // remove excess bits
+                                        if (info.pieces() as usize) < bitfield.len() {
+                                            unsafe {
+                                                bitfield.set_len(info.pieces() as usize);
+                                            }
+                                        }
+
+                                        debug!("local_bitfield is now of len {:?}", bitfield.len());
+
+                                        self.size = info.get_size();
+                                        self.have_info = true;
+
+                                        let mut info_l = self.ctx.info.write().await;
+
+                                        debug!("new info piece length {:?}", info.piece_length);
+                                        debug!("new info pieces_len {:?}", info.pieces.len());
+                                        debug!("new info pieces_len {:?}", info.pieces.len());
+                                        debug!("new info file_length {:?}", info.file_length);
+                                        debug!("new info files {:#?}", info.files);
+
+                                        *info_l = info;
+                                        drop(info_l);
+
+                                        self.status = TorrentStatus::Downloading;
+                                        self.ctx.disk_tx.send(DiskMsg::NewTorrent(self.ctx.clone())).await?;
+                                    } else {
+                                        warn!("a peer sent a valid Info, but the hash does not match \
+                                            the hash of the provided magnet link, panicking");
+                                        return Err(Error::PieceInvalid);
+                                    }
+                                }
+                            } else {
+                                warn!(total, index, "unneeded `TorrentMsg::DownloadedInfoPiece`");
                             }
                         }
                         TorrentMsg::RequestInfoPiece(index, recipient) => {
@@ -540,6 +575,17 @@ impl Torrent {
                         TorrentMsg::FailedPeer(addr) => {
                             self.failed_peers.push(addr);
                         },
+                        TorrentMsg::BlockAvailable => {
+                            let mut peer_txs = self
+                                .peer_ctxs
+                                .values()
+                                .map(|peer| &peer.tx)
+                                .collect::<Vec<_>>();
+                            peer_txs.shuffle(&mut rand::thread_rng());
+                            for peer_tx in peer_txs {
+                                let _ = peer_tx.send(PeerMsg::BlockAvailable).await;
+                            }
+                        }
                         TorrentMsg::Quit => {
                             info!("Quitting torrent {:?}", self.name);
                             let (otx, orx) = oneshot::channel();
@@ -638,19 +684,35 @@ impl Torrent {
                     }
                     drop(info);
                 }
-                // At every 5 seconds, try to reconnect to peers in which
+                // Periodically, try to reconnect to peers for whom
                 // the TCP connection failed.
                 _ = reconnect_failed_peers.tick() => {
                     for peer in self.failed_peers.clone() {
                         let ctx = self.ctx.clone();
                         let local_peer_id = self.tracker_ctx.peer_id;
-                        debug!("reconnecting_peer {peer:?}");
 
-                        if let Ok(socket) = TcpStream::connect(peer).await {
-                            self.failed_peers.retain(|v| *v != peer);
-                            Self::start_and_run_peer(ctx, socket, local_peer_id, Direction::Outbound)
-                                .await?;
-                        }
+                        self.failed_peers.retain(|v| *v != peer);
+                        /* Before, [`TcpStream::connect`] was called in the current task.
+                        As a result, the client practically hanged
+                        because [`TcpStream::connect`] may take 30 seconds. */
+                        spawn(async move {
+                            match TcpStream::connect(peer).await {
+                                Ok(socket) => {
+                                    Self::start_and_run_peer(
+                                        ctx,
+                                        socket,
+                                        local_peer_id,
+                                        Direction::Outbound,
+                                    )
+                                    .await?;
+                                }
+                                Err(e) => {
+                                    debug!("error with peer: {:?} {e:#?}", peer);
+                                    ctx.tx.send(TorrentMsg::FailedPeer(peer)).await?;
+                                }
+                            }
+                            Ok::<(), Error>(())
+                        });
                     }
                 }
             }

@@ -79,8 +79,8 @@ impl Default for BlockInfo {
     }
 }
 
-impl From<Block> for BlockInfo {
-    fn from(val: Block) -> Self {
+impl From<&Block> for BlockInfo {
+    fn from(val: &Block) -> Self {
         BlockInfo {
             index: val.index as u32,
             begin: val.begin,

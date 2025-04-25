@@ -3,7 +3,13 @@ members = [
   "crates/vcz_daemon",
   "crates/vcz_ui",
   "crates/vincenzo",
-  "crates/vcz"
+  "crates/vcz",
+  "crates/vcz_http_server"
 ]
 
 resolver = "2"
+
+[workspace.dependencies]
+vincenzo = { path = "crates/vincenzo" }
+vcz_http_server = { path = "crates/vcz_http_server" }
+vcz_ui = { path = "crates/vcz_ui" }
